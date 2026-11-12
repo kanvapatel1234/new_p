@@ -51,8 +51,25 @@ class ServiceContainer:
         pipeline_adapter: Optional[PipelineAdapter] = None,
         firewall_adapter: Optional[FirewallAdapter] = None,
         notification_manager: Optional[NotificationManager] = None,
+        auto_start_pipeline: bool = True,
     ) -> None:
         """Initializes or binds active pipeline instances to backend."""
+        # Auto-initialize DPI pipeline if none supplied and auto_start_pipeline is True
+        if pipeline_adapter is None and auto_start_pipeline:
+            if self.pipeline_adapter and self.pipeline_adapter.is_initialized:
+                pass  # Already initialized; avoid duplicate instances
+            else:
+                ingest_mode = os.getenv("DPI_INGESTION_MODE", "live").strip().lower()
+                if ingest_mode not in ("disabled", "none", "off"):
+                    try:
+                        from backend.integrations.pipeline_factory import create_pipeline
+                        pipeline_adapter = create_pipeline()
+                    except Exception as exc:
+                        import logging
+                        logging.getLogger("dpi_ids_ips.backend").error(
+                            f"Failed to auto-initialize DPI pipeline: {exc}", exc_info=True
+                        )
+
         if pipeline_adapter is not None:
             self.pipeline_adapter = pipeline_adapter
             self.alert_service = AlertService(self.pipeline_adapter)
@@ -92,6 +109,12 @@ class ServiceContainer:
                             "client_tag": getattr(client_ctx, "client_name", None),
                         },
                     )
+                    # Forward to notification manager
+                    if self.notification_manager:
+                        try:
+                            self.notification_manager.handle_alert(alert)
+                        except Exception:
+                            pass
 
                 pipeline_adapter.worker_pool.on_alert_generated = _ws_alert_hook
 
@@ -116,6 +139,13 @@ class ServiceContainer:
             self.traffic_broadcaster.stop()
         if self.notification_manager:
             self.notification_manager.stop()
+        if self.pipeline_adapter and self.pipeline_adapter.is_initialized:
+            try:
+                from backend.integrations.pipeline_factory import shutdown_pipeline
+                shutdown_pipeline(self.pipeline_adapter)
+            except Exception as e:
+                import logging
+                logging.getLogger("dpi_ids_ips.backend").error(f"Error shutting down pipeline: {e}")
 
 
 # Global service container instance

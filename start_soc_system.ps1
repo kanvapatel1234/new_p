@@ -13,12 +13,12 @@ Write-Host "============================================================" -Foreg
 
 # 1. Start Backend in separate window
 Write-Host "[1/2] Launching FastAPI Backend on port 8000..." -ForegroundColor Yellow
-$BackendCmd = "cd `"$Root\project_networking`"; `$env:PYTHONPATH=`"$Root\project_networking`"; `"$Root\.venv\Scripts\python.exe`" -m uvicorn backend.api.main:create_app --factory --host 127.0.0.1 --port 8000"
+$BackendCmd = "cd `"$Root`"; `$env:PYTHONPATH=`".`"; `$env:DPI_INGESTION_MODE=`"live`"; `$env:DPI_INTERFACE=`"tnnl`"; `$env:DPI_BPF_FILTER=`"ip`"; `$env:ML_ENABLED=`"true`"; `$env:EMAIL_ENABLED=`"false`"; `$env:DPI_ACTIVE_PREVENTION=`"false`"; `"$Root\.venv\Scripts\python.exe`" -m uvicorn backend.api.main:create_app --factory --host 127.0.0.1 --port 8000"
 Start-Process powershell -ArgumentList "-NoExit", "-Command", $BackendCmd
 
 # 2. Start Frontend in separate window
 Write-Host "[2/2] Launching React Vite SOC Frontend on port 5173..." -ForegroundColor Yellow
-$FrontendCmd = "cd `"$Root\frontend`"; npm run dev"
+$FrontendCmd = "cd `"$Root\frontend`"; if (-not (Test-Path node_modules)) { npm install }; npm run dev"
 Start-Process powershell -ArgumentList "-NoExit", "-Command", $FrontendCmd
 
 Write-Host "============================================================" -ForegroundColor Cyan

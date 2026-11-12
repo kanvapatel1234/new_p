@@ -24,14 +24,21 @@ def check_health(
     # 1. Pipeline status
     pipe_stats = pipeline_adapter.get_pipeline_stats()
     pipe_op = pipe_stats.get("status") == "active"
-    pipe_status = SubsystemStatus(
-        status=pipe_stats.get("status", "uninitialized"),
-        operational=pipe_op,
-        details={
+    details_dict = None
+    if pipe_op:
+        details_dict = {
             "total_processed": pipe_stats.get("total_processed", 0),
             "total_alerts": pipe_stats.get("total_alerts", 0),
             "active_workers": pipe_stats.get("active_workers", 0),
-        } if pipe_op else None,
+        }
+        if "packet_source" in pipe_stats:
+            details_dict["packet_source"] = pipe_stats["packet_source"].get("source_name", "unknown")
+            details_dict["capture_running"] = pipe_stats["packet_source"].get("is_running", False)
+
+    pipe_status = SubsystemStatus(
+        status=pipe_stats.get("status", "uninitialized"),
+        operational=pipe_op,
+        details=details_dict,
     )
 
     # 2. ML runtime status

@@ -47,7 +47,7 @@ class PipelineAdapter:
         if not self.worker_pool:
             return {"status": "uninitialized"}
         stats = self.worker_pool.get_stats_snapshot()
-        return {
+        res = {
             "status": "active",
             "total_processed": stats.total_processed,
             "total_bytes": stats.total_bytes,
@@ -58,6 +58,9 @@ class PipelineAdapter:
             "active_workers": stats.active_workers,
             "active_prevention": stats.active_prevention_enabled,
         }
+        if self.packet_source:
+            res["packet_source"] = self.packet_source.get_stats()
+        return res
 
     # =========================================================================
     # Alert Query Methods
