@@ -8,6 +8,15 @@ import struct
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+try:
+    from ids.dns.common import is_cdn_or_cloud_domain, is_legitimate_txt_record
+except ImportError:
+    def is_cdn_or_cloud_domain(domain: str) -> bool:
+        return False
+    def is_legitimate_txt_record(txt_content: str) -> bool:
+        clean = txt_content.strip().lower()
+        return any(clean.startswith(p) or p in clean for p in ("v=spf1", "v=dkim1", "v=dmarc1", "include:_spf", "google-site-verification="))
+
 DNS_QTYPES = {
     1: "A",
     2: "NS",
@@ -230,41 +239,50 @@ class DNSInspector:
             qtype_name = DNS_QTYPES.get(qtype, f"TYPE_{qtype}")
             questions.append(DNSQuestion(name=qname, qtype_code=qtype, qtype_name=qtype_name, qclass=qclass))
 
-            # Heuristic checks on domain name
+            # Heuristic checks on domain name using multiple independent indicators
             is_tunneling = False
             tunneling_indicators: List[str] = []
 
             if qname:
-                entropy = calculate_entropy(qname)
-                # DGA / Tunneling heuristic
-                if entropy > 4.2 and len(qname) > 18:
+                clean_qname = qname.strip().lower().rstrip(".")
+                is_cdn = is_cdn_or_cloud_domain(clean_qname)
+                entropy = calculate_entropy(clean_qname)
+                subdomains = clean_qname.split(".")
+
+                # DGA / Suspicious Domain heuristic (evaluated for non-CDN domains)
+                if not is_cdn and entropy > 4.2 and len(clean_qname) > 18:
                     is_suspicious = True
                     suspicious_reasons.append(f"High domain entropy ({entropy:.2f}) suggesting DGA or DNS tunneling")
 
-                if entropy > 3.8 and len(qname) > 35:
-                    is_tunneling = True
-                    tunneling_indicators.append(f"High entropy payload ({entropy:.2f}) in long query ({len(qname)} chars)")
-
-                if len(qname) > 70:
-                    is_suspicious = True
-                    is_tunneling = True
-                    suspicious_reasons.append(f"Excessive domain length ({len(qname)} chars)")
-                    tunneling_indicators.append(f"Abnormally long domain ({len(qname)} chars)")
-
-                subdomains = qname.split(".")
-                if len(subdomains) > 6:
+                if not is_cdn and len(subdomains) > 6:
                     is_suspicious = True
                     suspicious_reasons.append(f"Excessive subdomain depth ({len(subdomains)} levels)")
 
-                # Check for base32 / hex encoded tunneling subdomains
-                for sub in subdomains:
-                    if len(sub) > 40:
+                # Tunneling detection requires multiple corroborated independent indicators:
+                # Candidate subdomain label with extreme length (>= 45 for non-CDN, >= 50 for CDN), high entropy, and encoded pattern (hex/base32).
+                # Even for CDN domains, extreme encoded labels are evaluated so CDN recognition does not disable all tunneling detection.
+                sub_candidates = subdomains[:-2] if len(subdomains) > 2 else subdomains
+                for sub in sub_candidates:
+                    sub_len = len(sub)
+                    min_len = 50 if is_cdn else 45
+                    if sub_len >= min_len:
+                        sub_ent = calculate_entropy(sub)
+                        is_hex = sub_len >= 24 and all(c in "0123456789abcdefABCDEF" for c in sub) and any(c.isdigit() for c in sub)
+                        is_b32 = sub_len >= 24 and all(c in "abcdefghijklmnopqrstuvwxyz234567" for c in sub.lower()) and any(c in "234567" for c in sub)
+                        min_ent = 3.6 if is_hex else 3.8
+                        if (is_hex or is_b32) and sub_ent >= min_ent:
+                            is_tunneling = True
+                            enc_name = "Hex" if is_hex else "Base32"
+                            tunneling_indicators.append(f"Corroborated {enc_name}-encoded high-entropy label ({sub_len} chars, {sub_ent:.2f} entropy)")
+                            break
+
+                if not is_tunneling and not is_cdn and len(clean_qname) >= 110:
+                    longest_sub = max(subdomains, key=len) if subdomains else ""
+                    if len(longest_sub) >= 40 and calculate_entropy(longest_sub) >= 4.0:
+                        is_suspicious = True
                         is_tunneling = True
-                        tunneling_indicators.append(f"Abnormally long subdomain label ({len(sub)} chars)")
-                    # Hex encoding test
-                    if len(sub) > 20 and all(c in "0123456789abcdefABCDEF" for c in sub):
-                        is_tunneling = True
-                        tunneling_indicators.append(f"Hex-encoded data in subdomain label ({sub[:15]}...)")
+                        suspicious_reasons.append(f"Excessive domain length ({len(clean_qname)} chars) with high-entropy payload")
+                        tunneling_indicators.append(f"Excessive domain length ({len(clean_qname)} chars) with high-entropy payload")
 
         # Parse Answers
         answers: List[DNSAnswer] = []
@@ -305,9 +323,11 @@ class DNSInspector:
                     txt_chunks.append(t_chunk)
                     t_off += 1 + t_len
                 rdata_str = " ".join(txt_chunks)
-                if len(rdata_str) > 100:
-                    is_tunneling = True
-                    tunneling_indicators.append(f"Large TXT payload ({len(rdata_str)} chars) in DNS response")
+                if not is_legitimate_txt_record(rdata_str):
+                    ent = calculate_entropy(rdata_str)
+                    if len(rdata_str) > 200 and ent >= 3.6:
+                        is_tunneling = True
+                        tunneling_indicators.append(f"Suspicious large non-standard TXT payload ({len(rdata_str)} chars, entropy {ent:.2f}) in DNS response")
             elif rtype == 15 and rdlength >= 2:  # MX
                 pref = struct.unpack("!H", rdata_bytes[:2])[0]
                 mx_name, _ = cls._parse_name(data, offset - rdlength + 2)

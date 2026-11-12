@@ -302,7 +302,7 @@ class BehaviourDetector:
                                 severity=Severity[dt_cfg.get("severity", "HIGH")],
                                 matched_rule="DNS Tunneling Pattern Detected",
                                 evidence=reasons,
-                                recommended_action=DecisionAction[dt_cfg.get("action", "ALERT")],
+                                recommended_action=DecisionAction.ALERT,
                                 packet_id=packet.packet_id,
                             )
                         )
@@ -324,7 +324,7 @@ class BehaviourDetector:
                                 severity=rep_dom.threat_level,
                                 matched_rule=f"Domain Threat Intelligence: {rep_dom.category}",
                                 evidence=f"Queried domain '{dns_meta.query_name}' flagged in threat reputation: {rep_dom.description}",
-                                recommended_action=DecisionAction.BLOCK if rep_dom.threat_level in (Severity.CRITICAL, Severity.HIGH) else DecisionAction.ALERT,
+                                recommended_action=DecisionAction.BLOCK if rep_dom.threat_level == Severity.CRITICAL else DecisionAction.ALERT,
                                 packet_id=packet.packet_id,
                             )
                         )
@@ -492,7 +492,7 @@ class BehaviourDetector:
                             severity=Severity[pa.severity] if pa.severity in Severity.__members__ else Severity.HIGH,
                             matched_rule=f"Protocol Evasion: {pa.anomaly_type}",
                             evidence=pa.evidence,
-                            recommended_action=DecisionAction.BLOCK if pa.severity in ("CRITICAL", "HIGH") else DecisionAction.ALERT,
+                            recommended_action=DecisionAction.BLOCK if pa.severity == "CRITICAL" else DecisionAction.ALERT,
                             packet_id=packet.packet_id,
                         )
                     )
@@ -554,7 +554,7 @@ class BehaviourDetector:
                     severity=ra.severity,
                     matched_rule=f"Reconnaissance: {ra.alert_type}",
                     evidence=ra.evidence,
-                    recommended_action=DecisionAction.BLOCK if ra.severity in (Severity.CRITICAL, Severity.HIGH) else DecisionAction.ALERT,
+                    recommended_action=DecisionAction.BLOCK if ra.severity == Severity.CRITICAL else DecisionAction.ALERT,
                     packet_id=packet.packet_id,
                 )
             )

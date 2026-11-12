@@ -63,6 +63,7 @@ class DNSTunnelingDetector:
 
         src_ip, dst_ip, src_port, dst_port = get_packet_endpoints(packet)
 
+        is_cdn = is_cdn_or_cloud_domain(clean_domain)
         apex, subdomain = extract_apex_and_subdomain(clean_domain)
         sub_labels = subdomain.split(".") if subdomain else []
         longest_sub_label = max(sub_labels, key=len) if sub_labels else ""
@@ -91,7 +92,9 @@ class DNSTunnelingDetector:
         sub_entropy = 0.0
         if len(longest_sub_label) >= 25:
             sub_entropy = calculate_entropy(longest_sub_label)
-            if sub_entropy >= 4.0:
+            # Hex theoretical max is 4.0 (16 symbols); Base32/Base64 theoretical max is 5.0-6.0
+            min_sub_ent = 3.6 if (v2_encoding_triggered and encoding_type == "Hex") else 4.0
+            if sub_entropy >= min_sub_ent:
                 v3_entropy_triggered = True
 
         # Vector 4: Subdomain Churn Tracking (Composite Weight: 1.5)
@@ -112,11 +115,11 @@ class DNSTunnelingDetector:
                 del self._apex_queries[oldest_key]
 
             q_queue = self._apex_queries[key]
-            q_queue.append((now, clean_domain, len(clean_domain)))
+            q_queue.append((now, clean_domain, len(longest_sub_label), sub_entropy, v2_encoding_triggered))
 
             # Count unique subdomains in window using set comprehension
             # Repeated identical queries do not inflate unique count
-            recent_subs = {qname for ts, qname, _ in q_queue if now - ts <= self.window_seconds}
+            recent_subs = {item[1] for item in q_queue if now - item[0] <= self.window_seconds}
             churn_count = len(recent_subs)
 
             # CDN tolerance: CDNs resolve many edge shards; use threshold of 100
@@ -129,6 +132,43 @@ class DNSTunnelingDetector:
             # Dedicated high-churn rule trigger check
             if churn_count >= churn_threshold:
                 dedicated_churn_triggered = True
+
+            # Issue 3: Rolling Behavioral Analysis for Low-and-Slow DNS Tunneling
+            # Detects low-frequency exfiltration spanning multiple minutes (up to 300s window)
+            # where queries are spaced out to evade short churn thresholds.
+            low_and_slow_triggered = False
+            slow_evidence = ""
+            slow_window = 300.0
+            slow_queries = [
+                item for item in q_queue
+                if now - item[0] <= slow_window
+            ]
+            min_slow_count = 20 if is_cdn else 8
+            min_slow_len = 35 if is_cdn else 20
+            if len(slow_queries) >= min_slow_count:
+                unique_qnames = {item[1] for item in slow_queries}
+                uniqueness_ratio = len(unique_qnames) / len(slow_queries)
+                encoded_count = sum(1 for item in slow_queries if item[4])
+                encoded_ratio = encoded_count / len(slow_queries)
+                avg_entropy = sum(item[3] for item in slow_queries) / len(slow_queries)
+                avg_len = sum(item[2] for item in slow_queries) / len(slow_queries)
+
+                if (
+                    uniqueness_ratio >= 0.80
+                    and encoded_ratio >= 0.70
+                    and avg_entropy >= 3.4
+                    and avg_len >= min_slow_len
+                ):
+                    low_and_slow_triggered = True
+                    span = now - slow_queries[0][0]
+                    slow_evidence = (
+                        f"Low-and-Slow DNS Tunneling to '{apex}': {len(unique_qnames)} unique "
+                        f"encoded queries ({encoded_ratio * 100:.0f}%) over {span:.1f}s, "
+                        f"avg entropy {avg_entropy:.2f}, avg label len {avg_len:.1f}"
+                    )
+        else:
+            low_and_slow_triggered = False
+            slow_evidence = ""
 
         # Vector 5: Unusual Query Type (Weight: 0.5)
         # Note: Weight is 0.5; with a threshold of 3.5, an unusual query type alone can NEVER trigger an alert.
@@ -158,8 +198,14 @@ class DNSTunnelingDetector:
             + (0.5 if v5_type_triggered else 0.0)
         )
 
-        # 1. Composite Tunneling Path: Threshold strictly >= 3.5
-        if composite_score >= 3.5:
+        # 1. Composite Tunneling Path:
+        # Standard threshold is strictly >= 3.5 (requiring at least 3 independent vectors).
+        # For recognized CDN/cloud infrastructure, single-query noise is attenuated to threshold 4.5
+        # so confirmed strong signals (Length + Encoding + Entropy + Type) or multi-query churn trigger,
+        # without allowing CDN status to act as a complete detection bypass.
+        required_threshold = 4.5 if (is_cdn and not v4_churn_triggered) else 3.5
+
+        if composite_score >= required_threshold:
             indicators = []
             if v1_length_triggered:
                 indicators.append(f"Length(FQDN={len(clean_domain)}, Label={len(longest_sub_label)})")
@@ -173,7 +219,7 @@ class DNSTunnelingDetector:
                 indicators.append(f"UnusualQType={qtype_name}")
 
             evidence = (
-                f"DNS Tunneling Characteristics (Composite Score: {composite_score:.1f}/3.5): "
+                f"DNS Tunneling Characteristics (Composite Score: {composite_score:.1f}/{required_threshold:.1f}): "
                 f"Domain '{clean_domain[:64]}' to apex '{apex}' exhibited [{', '.join(indicators)}]."
             )
 
@@ -195,7 +241,27 @@ class DNSTunnelingDetector:
                 )
             )
 
-        # 2. Dedicated High-Churn Path: Pure Subdomain Burst (Severity: MEDIUM)
+        # 2. Low-and-Slow Covert Channel Path: Multi-request rolling behavioral analysis
+        elif low_and_slow_triggered:
+            alerts.append(
+                IDSAlert.create(
+                    alert_id=next_alert_id_fn(),
+                    timestamp=now,
+                    source_ip=src_ip,
+                    destination_ip=dst_ip,
+                    source_port=src_port,
+                    destination_port=dst_port,
+                    protocol="DNS",
+                    category=DetectionCategory.DNS_TUNNELING,
+                    severity=Severity.HIGH,
+                    matched_rule="Low-and-Slow DNS Tunneling Pattern",
+                    evidence=slow_evidence[:256],
+                    recommended_action=DecisionAction.ALERT,
+                    packet_id=packet.packet_id,
+                )
+            )
+
+        # 3. Dedicated High-Churn Path: Pure Subdomain Burst (Severity: MEDIUM)
         # Triggers when sustained query volume to a single apex exceeds churn threshold
         # even if individual labels are short or non-encoded
         elif dedicated_churn_triggered:
@@ -225,14 +291,15 @@ class DNSTunnelingDetector:
         return alerts
 
     def _prune_expired(self, now: float) -> None:
-        """Prunes tracking entries older than the rolling window."""
+        """Prunes tracking entries older than the rolling window (bounded up to 300s)."""
         if now - self._last_prune_time < 5.0:
             return
         self._last_prune_time = now
 
+        max_history = max(self.window_seconds, 300.0)
         expired_keys = []
         for key, q_queue in self._apex_queries.items():
-            while q_queue and now - q_queue[0][0] > self.window_seconds:
+            while q_queue and now - q_queue[0][0] > max_history:
                 q_queue.popleft()
             if not q_queue:
                 expired_keys.append(key)

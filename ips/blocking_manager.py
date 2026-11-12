@@ -20,7 +20,7 @@ from ips.rate_limiter import RateLimiter
 from ips.stateful_firewall import ConnectionState, FirewallAction, StatefulFirewall
 from ips.windows_firewall_enforcer import WindowsFirewallEnforcer
 from ips.windows_wfp_divert import WindowsFilteringStatus, WindowsWFPInvestigator
-from models.alert_model import DecisionAction, DPIResult, IDSAlert, Severity
+from models.alert_model import DecisionAction, DetectionCategory, DPIResult, IDSAlert, Severity
 from models.packet_models import ParsedPacket
 
 logger = logging.getLogger("dpi_ids_ips.ips.blocking_manager")
@@ -279,14 +279,17 @@ class BlockingManager:
             return self._enforce_block(packet, deny_reason, matched_rule="STATIC_DENYLIST")
 
         # 4. Dynamic Expirable Bans Check
-        is_dyn_blocked, dyn_ban = self.dynamic_blocks.is_blocked(src_ip, now)
-        if is_dyn_blocked and dyn_ban:
-            rem = dyn_ban.time_remaining(now)
-            return self._enforce_block(
-                packet,
-                f"Source IP {src_ip} is under dynamic temporary block ({rem:.1f}s remaining): {dyn_ban.reason}",
-                matched_rule="DYNAMIC_BLOCK",
-            )
+        # Secondary path guard: DNS resolver traffic is never subject to dynamic bans
+        if not (src_port == 53 or dst_port == 53 or self.allowlist_denylist.is_ip_allowlisted(src_ip)):
+            is_dyn_blocked, dyn_ban = self.dynamic_blocks.is_blocked(src_ip, now)
+            if is_dyn_blocked and dyn_ban:
+                rem = dyn_ban.time_remaining(now)
+                return self._enforce_block(
+                    packet,
+                    f"Source IP {src_ip} is under dynamic temporary block ({rem:.1f}s remaining): {dyn_ban.reason}",
+                    matched_rule="DYNAMIC_BLOCK",
+                    target_ip=src_ip,
+                )
 
         # 5. Client Security Policy Enforcement
         effective_client_ip = client_ip or (src_ip if is_outbound else dst_ip)
@@ -298,10 +301,12 @@ class BlockingManager:
                 return self._enforce_block(packet, pol_reason, matched_rule="CLIENT_SECURITY_POLICY")
 
         # 6. Rate Limiting Check (Token Bucket)
-        rate_key = src_ip if is_outbound else dst_ip
-        rate_ok, rate_reason = self.rate_limiter.check_rate_limit(rate_key, length, now)
-        if not rate_ok:
-            return self._enforce_block(packet, rate_reason, matched_rule="RATE_LIMITER")
+        # Secondary path guard: DNS resolver traffic is exempt from generic IP packet rate drops
+        if not (src_port == 53 or dst_port == 53 or self.allowlist_denylist.is_ip_allowlisted(src_ip)):
+            rate_key = src_ip if is_outbound else dst_ip
+            rate_ok, rate_reason = self.rate_limiter.check_rate_limit(rate_key, length, now)
+            if not rate_ok:
+                return self._enforce_block(packet, rate_reason, matched_rule="RATE_LIMITER", target_ip=rate_key)
 
         # 7. Static / Protocol-based Firewall Rules
         for rule in self.static_rules:
@@ -316,33 +321,56 @@ class BlockingManager:
 
         # 9. IDS Alerts & Dynamic Block Promotion
         active_alerts = alerts or []
-        has_block_alert = any(
-            a.recommended_action == DecisionAction.BLOCK or a.severity == Severity.CRITICAL
-            for a in active_alerts
-        )
-
-        if has_block_alert:
-            crit_alert = next(
-                (a for a in active_alerts if a.recommended_action == DecisionAction.BLOCK or a.severity == Severity.CRITICAL),
-                active_alerts[0],
+        blockable_alerts = [
+            a for a in active_alerts
+            if a.recommended_action == DecisionAction.BLOCK
+            and a.category not in (
+                DetectionCategory.ML_CLASSIFICATION,
+                DetectionCategory.ML_ANOMALY,
+                DetectionCategory.DNS_TUNNELING,
+                DetectionCategory.SUSPICIOUS_DNS,
             )
-            # Automatic promotion of critical attack to temporary dynamic block
+            and not ("unknown domain" in (a.matched_rule or "").lower() or "unknown domain" in (a.evidence or "").lower())
+        ]
+
+        if blockable_alerts:
+            crit_alert = blockable_alerts[0]
+            target_ip = self._select_offending_ip(crit_alert, packet, is_outbound)
+
+            # Issue 1 & 5: Protected DNS resolver traffic must not be blocked or dropped
+            if src_port == 53 or dst_port == 53 or self.allowlist_denylist.is_ip_allowlisted(target_ip) or not target_ip:
+                logger.info(f"Target IP {target_ip or src_ip} is protected DNS/allowlist traffic; skipping block and dynamic ban.")
+                self.alert_decisions += 1
+                self.forwarded_or_reinjected_packets += 1
+                if self.on_packet_forward_hook:
+                    self.on_packet_forward_hook(packet)
+                return IPSEnforcementResult(
+                    decision=DecisionAction.ALERT,
+                    effective_action="ALERT",
+                    is_forwarded=True,
+                    reason=f"Protected DNS Resolver Traffic Permitted with Alert: {crit_alert.matched_rule}",
+                    matched_rule=f"IDS_ALERT_{crit_alert.category.value}",
+                )
+
+            # For confirmed malicious non-DNS traffic with explicit block authorization:
             ban = self.dynamic_blocks.add_block(
-                ip_address=src_ip,
+                ip_address=target_ip,
                 reason=crit_alert.matched_rule,
                 severity=crit_alert.severity,
                 duration_seconds=self.default_ban_seconds,
                 alert_id=crit_alert.alert_id,
             )
-            # Mark flow in stateful firewall so subsequent packets fast-path drop
+            dynamic_ban_issued = True
+            ban_seconds = ban.duration_seconds
             self.stateful_firewall.block_connection(proto, src_ip, src_port, dst_ip, dst_port, crit_alert.matched_rule)
 
             return self._enforce_block(
                 packet,
                 f"IDS Decision BLOCK: {crit_alert.matched_rule} (Evidence: {crit_alert.evidence})",
                 matched_rule=f"IDS_ALERT_{crit_alert.category.value}",
-                dynamic_ban_issued=True,
-                ban_seconds=ban.duration_seconds,
+                dynamic_ban_issued=dynamic_ban_issued,
+                ban_seconds=ban_seconds,
+                target_ip=target_ip,
             )
 
         # 10. All checks passed -> Packet Allowed & Forwarded
@@ -362,6 +390,40 @@ class BlockingManager:
             state=fw_res.state,
         )
 
+    def _select_offending_ip(
+        self,
+        alert: Optional[IDSAlert],
+        packet: ParsedPacket,
+        is_outbound: bool,
+    ) -> str:
+        """
+        Accurately determines the true offending endpoint IP address.
+        Guarantees that an upstream recursive DNS resolver is never identified as the offender.
+        """
+        src_port = packet.tcp.src_port if packet.tcp else (packet.udp.src_port if packet.udp else 0)
+        dst_port = packet.tcp.dst_port if packet.tcp else (packet.udp.dst_port if packet.udp else 0)
+        src_ip = packet.ipv4.src_ip if packet.ipv4 else (packet.ipv6.src_ip if packet.ipv6 else "")
+        dst_ip = packet.ipv4.dst_ip if packet.ipv4 else (packet.ipv6.dst_ip if packet.ipv6 else "")
+
+        # For DNS traffic:
+        # Inbound DNS response from resolver on port 53: resolver (src_ip) is never the offender
+        if src_port == 53:
+            return ""
+        # Outbound DNS query to resolver on port 53: resolver (dst_ip) is never the offender
+        if dst_port == 53:
+            return src_ip if not self.allowlist_denylist.is_ip_allowlisted(src_ip) else ""
+
+        # For non-DNS traffic:
+        if alert and alert.source_ip and not self.allowlist_denylist.is_ip_allowlisted(alert.source_ip):
+            return alert.source_ip
+
+        if not is_outbound:
+            # Inbound attack: source IP is external offender
+            return src_ip if not self.allowlist_denylist.is_ip_allowlisted(src_ip) else ""
+        else:
+            # Outbound: internal client is offending source
+            return src_ip if not self.allowlist_denylist.is_ip_allowlisted(src_ip) else ""
+
     def _enforce_block(
         self,
         packet: ParsedPacket,
@@ -370,17 +432,29 @@ class BlockingManager:
         state: ConnectionState = ConnectionState.NEW,
         dynamic_ban_issued: bool = False,
         ban_seconds: float = 0.0,
+        target_ip: Optional[str] = None,
     ) -> IPSEnforcementResult:
         """Applies the block decision adhering to Simulation vs Active Prevention mode."""
         self.security_block_decisions += 1
         src_ip = packet.ipv4.src_ip if packet.ipv4 else (packet.ipv6.src_ip if packet.ipv6 else "")
+        src_port = packet.tcp.src_port if packet.tcp else (packet.udp.src_port if packet.udp else 0)
+        dst_port = packet.tcp.dst_port if packet.tcp else (packet.udp.dst_port if packet.udp else 0)
+
+        effective_target = target_ip or src_ip
+        is_protected_dns = (
+            src_port == 53
+            or dst_port == 53
+            or self.allowlist_denylist.is_ip_allowlisted(effective_target)
+            or self.allowlist_denylist.is_ip_allowlisted(src_ip)
+        )
 
         if self.active_prevention:
             # Mode: ACTIVE PREVENTION
             fw_success = False
-            if src_ip:
+            # Protected DNS resolver and allowlisted IPs must NEVER invoke OS firewall
+            if effective_target and not is_protected_dns:
                 fw_success = self.firewall_enforcer.block_ip(
-                    ip=src_ip,
+                    ip=effective_target,
                     reason=reason,
                     duration_seconds=ban_seconds or self.default_ban_seconds,
                     now=packet.timestamp,
@@ -393,7 +467,7 @@ class BlockingManager:
 
                 logger.warning(
                     f"[IPS ACTUAL BLOCK] Packet {packet.packet_id} DROPPED via OS Firewall rule. "
-                    f"Rule: {matched_rule}. Reason: {reason}"
+                    f"Rule: {matched_rule}. Reason: {reason}. Target IP: {effective_target}"
                 )
                 return IPSEnforcementResult(
                     decision=DecisionAction.BLOCK,
@@ -406,10 +480,26 @@ class BlockingManager:
                     ban_seconds=ban_seconds,
                     enforcement_succeeded=True,
                 )
+            elif is_protected_dns:
+                # Protected DNS resolver traffic must NOT be dropped
+                self.forwarded_or_reinjected_packets += 1
+                if self.on_packet_forward_hook:
+                    self.on_packet_forward_hook(packet)
+                return IPSEnforcementResult(
+                    decision=DecisionAction.ALERT,
+                    effective_action="ALERT",
+                    is_forwarded=True,
+                    reason=f"Protected DNS Traffic Overridden from Block: {reason}",
+                    matched_rule=matched_rule,
+                    state=state,
+                    dynamic_ban_issued=False,
+                    ban_seconds=0.0,
+                    enforcement_succeeded=False,
+                )
             else:
                 # Firewall rule creation failed on OS
                 logger.error(
-                    f"[IPS ENFORCEMENT FAILED] Failed to apply OS firewall rule for {src_ip}. "
+                    f"[IPS ENFORCEMENT FAILED] Failed to apply OS firewall rule for {effective_target}. "
                     f"Rule: {matched_rule}. Reason: {reason}. Dropped in user-space software only."
                 )
                 if self.on_packet_drop_hook:
@@ -467,13 +557,16 @@ class BlockingManager:
             return DecisionAction.ALERT, "Traffic Allowed with Alert"
 
         if decision == DecisionAction.BLOCK:
-            # 1. Safety Allowlist override check
-            if self.is_allowlisted(packet):
+            src_port = packet.tcp.src_port if packet.tcp else (packet.udp.src_port if packet.udp else 0)
+            dst_port = packet.tcp.dst_port if packet.tcp else (packet.udp.dst_port if packet.udp else 0)
+
+            # 1. Safety Allowlist & DNS Resolver override check
+            if self.is_allowlisted(packet) or (src_port == 53 and not self.allowlist_denylist.is_denylisted(packet)[0]):
                 self.intercepted_packets += 1
-                logger.info("Block decision overridden by safety allowlist.")
+                logger.info("Block decision overridden by safety allowlist / resolver protection.")
                 self.alert_decisions += 1
                 self.forwarded_or_reinjected_packets += 1
-                return DecisionAction.ALERT, "Block Overridden by Allowlist"
+                return DecisionAction.ALERT, "Block Overridden by Allowlist / DNS Resolver Protection"
 
             # 2. Emergency Killswitch bypass check
             if self.killswitch.is_active:
@@ -493,11 +586,25 @@ class BlockingManager:
 
             # 4. Active Prevention Mode: invoke enforcement pipeline
             active_alerts = alerts or []
-            has_block_alert = any(
-                a.recommended_action == DecisionAction.BLOCK or a.severity == Severity.CRITICAL
-                for a in active_alerts
-            )
-            if has_block_alert:
+            blockable_alerts = [
+                a for a in active_alerts
+                if a.recommended_action == DecisionAction.BLOCK
+                and a.category not in (
+                    DetectionCategory.ML_CLASSIFICATION,
+                    DetectionCategory.ML_ANOMALY,
+                    DetectionCategory.DNS_TUNNELING,
+                    DetectionCategory.SUSPICIOUS_DNS,
+                )
+                and not ("unknown domain" in (a.matched_rule or "").lower() or "unknown domain" in (a.evidence or "").lower())
+            ]
+            if active_alerts and not blockable_alerts:
+                # All active alerts are advisory (ML, DNS tunneling, unknown domain, etc.)
+                self.intercepted_packets += 1
+                self.alert_decisions += 1
+                self.forwarded_or_reinjected_packets += 1
+                return DecisionAction.ALERT, "Block Overridden: Advisory Threat Category"
+
+            if blockable_alerts:
                 res = self.evaluate_and_enforce(packet=packet, alerts=alerts)
                 return res.decision, res.reason
             else:

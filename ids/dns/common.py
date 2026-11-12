@@ -160,21 +160,63 @@ CURATED_PUBLIC_SUFFIXES: Tuple[str, ...] = (
 # but it requires all 4 independent DGA heuristics to trigger simultaneously. It does NOT suppress independent
 # anomalous behavior such as excessive query floods, abnormal response codes, or unauthorized zone transfers.
 CDN_PROVIDER_DOMAINS: Tuple[str, ...] = (
-    "cloudfront.net",
+    # Google & YouTube Infrastructure
+    "google.com",
+    "googlevideo.com",
+    "googleusercontent.com",
+    "googleapis.com",
+    "gstatic.com",
+    "gvt1.com",
+    "ggpht.com",
+    "1e100.net",
+    "youtube.com",
+    "ytimg.com",
+    "youtubekids.com",
+    "doubleclick.net",
+    "google-analytics.com",
+    "googlesyndication.com",
+    # Microsoft & Azure Infrastructure
+    "microsoft.com",
+    "azure.com",
+    "azureedge.net",
+    "trafficmanager.net",
+    "windows.com",
+    "windowsupdate.com",
+    "live.com",
+    "office.com",
+    "office365.com",
+    "msn.com",
+    "skype.com",
+    "bing.com",
+    # Amazon AWS & CloudFront
     "amazonaws.com",
+    "cloudfront.net",
+    "amazon.com",
+    # Cloudflare & Fastly
+    "cloudflare.com",
+    "cloudflare-dns.com",
+    "fastly.net",
+    # Akamai
     "akamai.net",
     "akamaiedge.net",
     "akadns.net",
-    "azure.com",
-    "trafficmanager.net",
-    "azureedge.net",
-    "1e100.net",
-    "googlevideo.com",
-    "googleusercontent.com",
-    "cloudflare.com",
-    "fastly.net",
+    "edgekey.net",
+    # Apple Infrastructure
+    "apple.com",
+    "icloud.com",
+    "aaplimg.com",
+    "apple-dns.net",
+    # Meta / Facebook
+    "facebook.com",
+    "fbcdn.net",
+    "cdninstagram.com",
+    "instagram.com",
+    # Developer & Media Platforms
     "github.io",
+    "githubusercontent.com",
     "gitlab.io",
+    "sentry.io",
+    "live-video.net",
 )
 
 # Standard legitimate email and domain ownership verification prefixes in TXT records

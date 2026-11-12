@@ -92,19 +92,11 @@ class MLRuntimeEngine:
         """Loads model bundles gracefully; on failure or missing files, disables ML without crashing."""
         base_dir = self.config.artifacts_dir
         if not os.path.exists(base_dir):
-            if base_dir.startswith("project_networking/") or base_dir.startswith("project_networking\\"):
-                stripped = re.sub(r"^[/\\]?project_networking[/\\]", "", base_dir)
-                if os.path.exists(stripped):
-                    base_dir = os.path.abspath(stripped)
-                else:
-                    logger.warning(f"Configured ML artifacts directory '{base_dir}' does not exist. Disabling ML models.")
-                    self.rf_model = None
-                    self.if_model = None
-                    return
-            elif base_dir in ("ml/artifacts", "artifacts"):
-                alt_dir = os.path.join(os.path.dirname(__file__), "..", "artifacts")
+            clean_base = base_dir.replace("\\", "/").rstrip("/")
+            if clean_base in ("project_networking/ml/artifacts", "ml/artifacts", "artifacts") or clean_base.endswith("ml/artifacts"):
+                alt_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "artifacts"))
                 if os.path.exists(alt_dir):
-                    base_dir = os.path.abspath(alt_dir)
+                    base_dir = alt_dir
                 else:
                     logger.warning(f"Configured ML artifacts directory '{base_dir}' does not exist. Disabling ML models.")
                     self.rf_model = None

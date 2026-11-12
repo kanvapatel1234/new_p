@@ -50,8 +50,9 @@ class DomainReputationMatcher:
 
         # 2. Bounded parent subdomain match
         # Split on '.' and check each parent level: sub.target.evil.com -> target.evil.com -> evil.com
+        # Must require at least 2 labels (e.g. 'evil.com') to prevent matching bare TLDs like 'com'
         parts = clean.split(".")
-        for i in range(1, len(parts)):
+        for i in range(1, len(parts) - 1):
             parent_candidate = ".".join(parts[i:])
             if parent_candidate in self._exact_domains:
                 ind = self._exact_domains[parent_candidate]

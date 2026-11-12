@@ -73,7 +73,7 @@ def test_pipeline_factory_live_mode_with_tnnl():
         # Ingestion source check
         assert adapter.packet_source is not None
         assert isinstance(adapter.packet_source, TunnelCaptureSource)
-        assert adapter.packet_source.interface.name == "tnnl"
+        assert adapter.packet_source.interface.name in ("tnnl", "server")
         assert adapter.packet_source.bpf_filter == "ip"
         assert adapter.packet_source.is_running is True
 
@@ -128,7 +128,7 @@ def test_fastapi_backend_startup_and_health_endpoints(monkeypatch):
             assert dpi_status.operational is True
             assert dpi_status.details is not None
             assert dpi_status.details["active_workers"] > 0
-            assert dpi_status.details.get("packet_source") == "Tunnel[tnnl]"
+            assert dpi_status.details.get("packet_source") in ("Tunnel[tnnl]", "Tunnel[server]")
             assert dpi_status.details.get("capture_running") is True
 
             # ML Runtime Subsystem

@@ -247,6 +247,24 @@ class AllowlistDenylistManager:
     def add_denylist_domain(self, domain: str) -> None:
         self.denylisted_domains.add(domain.strip().lower().rstrip("."))
 
+    def is_ip_allowlisted(self, ip_str: str) -> bool:
+        """Checks if an individual IP is protected from dynamic blocks (e.g. resolvers, loopback, gateway)."""
+        if not ip_str:
+            return False
+        if ip_str in self.allowlisted_ips:
+            return True
+        if ip_str in {"8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1", "9.9.9.9", "149.112.112.112"}:
+            return True
+        try:
+            addr = ipaddress.ip_address(ip_str)
+            if addr.is_loopback or addr.is_multicast or addr.is_unspecified:
+                return True
+            if any(addr in net for net in self.allowlisted_subnets):
+                return True
+        except ValueError:
+            pass
+        return False
+
     def is_allowlisted(self, packet: ParsedPacket) -> bool:
         """Determines if a packet is protected by the safety allowlist."""
         src_ip = packet.ipv4.src_ip if packet.ipv4 else (packet.ipv6.src_ip if packet.ipv6 else "")
